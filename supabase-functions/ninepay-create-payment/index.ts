@@ -94,7 +94,7 @@ serve(async (req) => {
         }
 
         const body = await req.json();
-        const { userId, planId, months, affiliateCodeId, affiliateId, discountAmount, clientIp } = body;
+        const { userId, planId, months, affiliateCodeId, affiliateId, discountAmount, clientIp, paymentMethod } = body;
 
         console.log("9Pay Request:", { userId, planId, months });
 
@@ -135,134 +135,193 @@ serve(async (req) => {
         const baseUrl = Deno.env.get("NINEPAY_RETURN_URL") || "https://www.englishaidol.com";
         const returnUrl = `${baseUrl}/dashboard?payment=success&provider=9pay&invoice=${invoiceNo}`;
 
-        // ============================================================
-        // 9Pay Bank Transfer API (from official Postman collection)
-        //
-        // Endpoint: POST /api/payments/create-bank-transfer
-        // Auth: Authorization header with HMAC-SHA256 signature
-        // Body: form-data with all parameters
-        //
-        // This is a SERVER-TO-SERVER call (not a portal redirect!)
-        // 9Pay returns bank transfer details (account, QR code, etc.)
-        // ============================================================
+        // Determine payment method: "ZALOPAY_WALLET" for ZaloPay, default "COLLECTION" for bank transfer
+        const method = paymentMethod || "COLLECTION";
+        const isPortalRedirect = method !== "COLLECTION"; // ZaloPay, MoMo, etc. use portal redirect
 
-        const parameters: Record<string, string | number> = {
-            merchantKey: merchantKey,
-            time: time,
-            invoice_no: invoiceNo,
-            lang: "vi",
-            client_ip: clientIp || "127.0.0.1",
-            amount: amountVND,
-            currency: "VND",
-            method: "COLLECTION",
-            description: `English AIdol ${planKey} ${months}m`,
-            return_url: returnUrl,
-            expires_time: 100, // minutes before transfer expires
-        };
+        console.log("Payment method:", method, "Portal redirect:", isPortalRedirect);
 
-        // Build sorted URL-encoded query string (matching Postman pre-script)
-        const httpQuery = buildHttpQuery(parameters);
+        if (isPortalRedirect) {
+            // ============================================================
+            // 9Pay Portal Redirect (for ZaloPay, MoMo, etc.)
+            //
+            // Flow: Build portal URL → redirect user → 9Pay handles payment
+            // Portal URL: {endpoint}/portal?baseEncode={base64}&signature={hmac}
+            // Signature uses correct buildHttpQuery from Postman pre-script
+            // ============================================================
 
-        // Build string to sign (matching Postman pre-script exactly)
-        // POST\n{endpoint}/api/payments/create-bank-transfer\n{time}\n{httpQuery}
-        const message = `POST\n${apiEndpoint}/api/payments/create-bank-transfer\n${time}\n${httpQuery}`;
-        console.log("String to sign:", message);
-
-        // Generate HMAC-SHA256 signature
-        const signature = await buildSignature(message, merchantSecretKey);
-        console.log("Signature:", signature);
-
-        // Build form data body (matching Postman body)
-        const formData = new FormData();
-        Object.entries(parameters).forEach(([key, value]) => {
-            formData.append(key, String(value));
-        });
-
-        // Make server-to-server POST request to 9Pay
-        // Headers match Postman: Authorization + Date
-        const apiUrl = `${apiEndpoint}/api/payments/create-bank-transfer`;
-        console.log("Calling 9Pay API:", apiUrl);
-
-        const ninePayResponse = await fetch(apiUrl, {
-            method: "POST",
-            headers: {
-                "Authorization": `Signature Algorithm=HS256,Credential=${merchantKey},SignedHeaders=,Signature=${signature}`,
-                "Date": String(time),
-            },
-            body: formData,
-        });
-
-        const responseStatus = ninePayResponse.status;
-        const responseText = await ninePayResponse.text();
-        console.log("9Pay API Response - Status:", responseStatus, "Body:", responseText);
-
-        let ninePayData: any;
-        try {
-            ninePayData = JSON.parse(responseText);
-        } catch (e) {
-            console.error("Failed to parse 9Pay response:", responseText);
-            return new Response(
-                JSON.stringify({
-                    error: "Invalid response from payment gateway",
-                    details: responseText.substring(0, 500),
-                    httpStatus: responseStatus,
-                }),
-                { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-            );
-        }
-
-        // Check for errors from 9Pay
-        // Bank transfer response has: payment_no, status=2 (pending), list_bank_info
-        // status=2 means "awaiting transfer" which is SUCCESS for creation
-        // Only treat as error if HTTP is not 200 or there's no payment_no/list_bank_info
-        const hasPaymentNo = ninePayData.payment_no || ninePayData.data?.payment_no;
-        const hasBankInfo = ninePayData.list_bank_info || ninePayData.data?.list_bank_info;
-        if (responseStatus !== 200 || (!hasPaymentNo && !hasBankInfo)) {
-            console.error("9Pay API error:", JSON.stringify(ninePayData));
-            return new Response(
-                JSON.stringify({
-                    error: ninePayData.message || ninePayData.failure_reason || "Payment gateway error",
-                    details: ninePayData,
-                    httpStatus: responseStatus,
-                }),
-                { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-            );
-        }
-
-        console.log("9Pay bank transfer created successfully - payment_no:", hasPaymentNo);
-
-        // Store pending payment
-        await supabaseAdmin.from("pending_payments").insert({
-            invoice_no: invoiceNo,
-            user_id: userId,
-            plan_id: planId,
-            months: months || 1,
-            amount_vnd: amountVND,
-            provider: "9pay",
-            status: "pending",
-            affiliate_code_id: affiliateCodeId || null,
-            affiliate_id: affiliateId || null,
-            created_at: new Date().toISOString(),
-        });
-
-        // Return bank transfer details to frontend
-        // 9Pay returns at root level: payment_no, list_bank_info[], amount, status, etc.
-        const bankData = ninePayData.data || ninePayData;
-        return new Response(
-            JSON.stringify({
-                success: true,
-                invoiceNo: invoiceNo,
+            const parameters: Record<string, string | number> = {
+                merchantKey: merchantKey,
+                time: time,
+                invoice_no: invoiceNo,
                 amount: amountVND,
-                bankTransfer: {
-                    payment_no: bankData.payment_no,
-                    list_bank_info: bankData.list_bank_info || [],
-                    expires_time: bankData.expires_time,
-                    deep_link: bankData.deep_link,
+                description: `English AIdol ${planKey} ${months}m`,
+                return_url: returnUrl,
+                method: method,
+                currency: "VND",
+                lang: "vi",
+            };
+
+            // Build sorted URL-encoded query string (matching Postman pre-script)
+            const httpQuery = buildHttpQuery(parameters);
+
+            // Build string to sign: POST\n{endpoint}/payments/create\n{time}\n{httpQuery}
+            const message = `POST\n${apiEndpoint}/payments/create\n${time}\n${httpQuery}`;
+            console.log("Portal string to sign:", message);
+
+            const signature = await buildSignature(message, merchantSecretKey);
+            console.log("Portal signature:", signature);
+
+            // Base64 encode the params JSON
+            const baseEncode = btoa(JSON.stringify(parameters));
+
+            // Build portal URL
+            const portalParams = buildHttpQuery({
+                baseEncode: baseEncode,
+                signature: signature,
+            });
+            const paymentUrl = `${apiEndpoint}/portal?${portalParams}`;
+            console.log("Portal payment URL generated:", paymentUrl);
+
+            // Store pending payment
+            await supabaseAdmin.from("pending_payments").insert({
+                invoice_no: invoiceNo,
+                user_id: userId,
+                plan_id: planId,
+                months: months || 1,
+                amount_vnd: amountVND,
+                provider: "9pay",
+                status: "pending",
+                affiliate_code_id: affiliateCodeId || null,
+                affiliate_id: affiliateId || null,
+                created_at: new Date().toISOString(),
+            });
+
+            return new Response(
+                JSON.stringify({
+                    success: true,
+                    paymentUrl: paymentUrl,
+                    invoiceNo: invoiceNo,
+                    amount: amountVND,
+                }),
+                { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+            );
+
+        } else {
+            // ============================================================
+            // 9Pay Bank Transfer API (from official Postman collection)
+            //
+            // Endpoint: POST /api/payments/create-bank-transfer
+            // Auth: Authorization header with HMAC-SHA256 signature
+            // Body: form-data with all parameters
+            //
+            // This is a SERVER-TO-SERVER call (not a portal redirect!)
+            // 9Pay returns bank transfer details (account, QR code, etc.)
+            // ============================================================
+
+            const parameters: Record<string, string | number> = {
+                merchantKey: merchantKey,
+                time: time,
+                invoice_no: invoiceNo,
+                lang: "vi",
+                client_ip: clientIp || "127.0.0.1",
+                amount: amountVND,
+                currency: "VND",
+                method: "COLLECTION",
+                description: `English AIdol ${planKey} ${months}m`,
+                return_url: returnUrl,
+                expires_time: 100,
+            };
+
+            const httpQuery = buildHttpQuery(parameters);
+            const message = `POST\n${apiEndpoint}/api/payments/create-bank-transfer\n${time}\n${httpQuery}`;
+            console.log("Bank transfer string to sign:", message);
+
+            const signature = await buildSignature(message, merchantSecretKey);
+            console.log("Signature:", signature);
+
+            const formData = new FormData();
+            Object.entries(parameters).forEach(([key, value]) => {
+                formData.append(key, String(value));
+            });
+
+            const apiUrl = `${apiEndpoint}/api/payments/create-bank-transfer`;
+            console.log("Calling 9Pay API:", apiUrl);
+
+            const ninePayResponse = await fetch(apiUrl, {
+                method: "POST",
+                headers: {
+                    "Authorization": `Signature Algorithm=HS256,Credential=${merchantKey},SignedHeaders=,Signature=${signature}`,
+                    "Date": String(time),
                 },
-                paymentNo: bankData.payment_no || null,
-            }),
-            { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-        );
+                body: formData,
+            });
+
+            const responseStatus = ninePayResponse.status;
+            const responseText = await ninePayResponse.text();
+            console.log("9Pay API Response - Status:", responseStatus, "Body:", responseText);
+
+            let ninePayData: any;
+            try {
+                ninePayData = JSON.parse(responseText);
+            } catch (e) {
+                console.error("Failed to parse 9Pay response:", responseText);
+                return new Response(
+                    JSON.stringify({
+                        error: "Invalid response from payment gateway",
+                        details: responseText.substring(0, 500),
+                        httpStatus: responseStatus,
+                    }),
+                    { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+                );
+            }
+
+            const hasPaymentNo = ninePayData.payment_no || ninePayData.data?.payment_no;
+            const hasBankInfo = ninePayData.list_bank_info || ninePayData.data?.list_bank_info;
+            if (responseStatus !== 200 || (!hasPaymentNo && !hasBankInfo)) {
+                console.error("9Pay API error:", JSON.stringify(ninePayData));
+                return new Response(
+                    JSON.stringify({
+                        error: ninePayData.message || ninePayData.failure_reason || "Payment gateway error",
+                        details: ninePayData,
+                        httpStatus: responseStatus,
+                    }),
+                    { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+                );
+            }
+
+            console.log("9Pay bank transfer created successfully - payment_no:", hasPaymentNo);
+
+            await supabaseAdmin.from("pending_payments").insert({
+                invoice_no: invoiceNo,
+                user_id: userId,
+                plan_id: planId,
+                months: months || 1,
+                amount_vnd: amountVND,
+                provider: "9pay",
+                status: "pending",
+                affiliate_code_id: affiliateCodeId || null,
+                affiliate_id: affiliateId || null,
+                created_at: new Date().toISOString(),
+            });
+
+            const bankData = ninePayData.data || ninePayData;
+            return new Response(
+                JSON.stringify({
+                    success: true,
+                    invoiceNo: invoiceNo,
+                    amount: amountVND,
+                    bankTransfer: {
+                        payment_no: bankData.payment_no,
+                        list_bank_info: bankData.list_bank_info || [],
+                        expires_time: bankData.expires_time,
+                        deep_link: bankData.deep_link,
+                    },
+                    paymentNo: bankData.payment_no || null,
+                }),
+                { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+            );
+        }
 
     } catch (error) {
         console.error("Fatal Error:", error);
