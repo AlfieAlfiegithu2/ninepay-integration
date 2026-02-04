@@ -212,17 +212,24 @@ serve(async (req) => {
         }
 
         // Check for errors from 9Pay
-        if (responseStatus !== 200 || ninePayData.status?.code !== 0) {
+        // Bank transfer response has: payment_no, status=2 (pending), list_bank_info
+        // status=2 means "awaiting transfer" which is SUCCESS for creation
+        // Only treat as error if HTTP is not 200 or there's no payment_no/list_bank_info
+        const hasPaymentNo = ninePayData.payment_no || ninePayData.data?.payment_no;
+        const hasBankInfo = ninePayData.list_bank_info || ninePayData.data?.list_bank_info;
+        if (responseStatus !== 200 || (!hasPaymentNo && !hasBankInfo)) {
             console.error("9Pay API error:", JSON.stringify(ninePayData));
             return new Response(
                 JSON.stringify({
-                    error: ninePayData.message || ninePayData.status?.message || "Payment gateway error",
+                    error: ninePayData.message || ninePayData.failure_reason || "Payment gateway error",
                     details: ninePayData,
                     httpStatus: responseStatus,
                 }),
                 { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
             );
         }
+
+        console.log("9Pay bank transfer created successfully - payment_no:", hasPaymentNo);
 
         // Store pending payment
         await supabaseAdmin.from("pending_payments").insert({
@@ -239,14 +246,20 @@ serve(async (req) => {
         });
 
         // Return bank transfer details to frontend
-        // 9Pay returns: payment_no, bank info, QR code, amount, expiry, etc.
+        // 9Pay returns at root level: payment_no, list_bank_info[], amount, status, etc.
+        const bankData = ninePayData.data || ninePayData;
         return new Response(
             JSON.stringify({
                 success: true,
                 invoiceNo: invoiceNo,
                 amount: amountVND,
-                bankTransfer: ninePayData.data || ninePayData, // Bank transfer details from 9Pay
-                paymentNo: ninePayData.data?.payment_no || null,
+                bankTransfer: {
+                    payment_no: bankData.payment_no,
+                    list_bank_info: bankData.list_bank_info || [],
+                    expires_time: bankData.expires_time,
+                    deep_link: bankData.deep_link,
+                },
+                paymentNo: bankData.payment_no || null,
             }),
             { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
