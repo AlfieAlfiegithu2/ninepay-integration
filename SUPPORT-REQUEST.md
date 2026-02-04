@@ -269,13 +269,19 @@ If our account setup is wrong, please provide:
 1. A working test portal URL for our merchant that we can open in a browser
 2. Or a minimal code sample that works with our merchant key `q9n2F8`
 
-### Option D: GitHub Collaboration
-We have created a **private GitHub repository** containing ONLY the 9Pay integration code (no other application code). We can invite your developer to collaborate directly:
+### Option D: GitHub Collaboration (Recommended)
+We have created a **public GitHub repository** containing ONLY the 9Pay integration code (no other application code). Your developer can review our code, suggest fixes, and submit changes directly:
 
 - **Repository:** https://github.com/AlfieAlfiegithu2/ninepay-integration
-- Contains: payment creation function, webhook handler, this support document
-- Your developer can review, edit, and fix the code directly
-- Please provide your developer's GitHub username and we will add them as a collaborator
+- Contains: payment creation function, webhook handler, this support document, environment config
+
+**How to contribute (Fork + Pull Request):**
+1. Go to the repository and click **"Fork"** (top right) to create your own copy
+2. Make your changes/fixes in your forked copy
+3. Click **"New Pull Request"** to submit the changes back to us
+4. We will review and merge the fix into our production code
+
+This way your developer can directly edit the code and show us what needs to change, rather than explaining over email.
 
 ### Contact
 - **Website:** https://www.englishaidol.com
