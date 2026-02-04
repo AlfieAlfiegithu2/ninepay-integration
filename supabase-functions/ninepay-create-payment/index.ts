@@ -3,7 +3,7 @@ import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
 import { crypto } from "https://deno.land/std@0.190.0/crypto/mod.ts";
 
-console.log("Ninepay function loaded");
+console.log("Ninepay function loaded (Bank Transfer API v2)");
 
 const corsHeaders = {
     "Access-Control-Allow-Origin": "*",
@@ -34,7 +34,8 @@ const PRICING_VND: Record<string, Record<string, number>> = {
 
 /**
  * HMAC-SHA256 sign and return base64.
- * Matches: crypto.createHmac("sha256", secret).update(data).digest().toString('base64')
+ * Matches 9Pay Postman pre-script:
+ *   CryptoJS.HmacSHA256(data, secret) → CryptoJS.enc.Base64.stringify(signature)
  */
 async function buildSignature(data: string, secret: string): Promise<string> {
     const encoder = new TextEncoder();
@@ -51,23 +52,15 @@ async function buildSignature(data: string, secret: string): Promise<string> {
 
 /**
  * Build URL-encoded query string with SORTED keys.
- * Matches EXACTLY the official 9Pay JavaScript sample from:
- * https://gitlab.com/9pay-sample/sample-javascript/-/blob/main/index.js
- * Uses URLSearchParams (same as their sample), keys sorted alphabetically.
+ * Matches 9Pay Postman pre-script buildHttpQuery:
+ *   Object.keys(params).sort().map(key => encodeURIComponent(key) + '=' + encodeURIComponent(params[key])).join('&')
+ *   Then replace %20 with +
  */
 function buildHttpQuery(data: Record<string, string | number>): string {
-    const httpQuery = new URLSearchParams();
-    const ordered = Object.keys(data).sort().reduce(
-        (obj: Record<string, string | number>, key: string) => {
-            obj[key] = data[key];
-            return obj;
-        },
-        {} as Record<string, string | number>
-    );
-    Object.keys(ordered).forEach(function (parameterName) {
-        httpQuery.append(parameterName, String(ordered[parameterName]));
-    });
-    return httpQuery.toString();
+    const queryString = Object.keys(data).sort().map((key) => {
+        return encodeURIComponent(key) + '=' + encodeURIComponent(String(data[key]));
+    }).join('&');
+    return queryString.replace(/%20/g, "+");
 }
 
 serve(async (req) => {
@@ -82,9 +75,8 @@ serve(async (req) => {
         const merchantKey = Deno.env.get("NINEPAY_MERCHANT_KEY") || "";
         const merchantSecretKey = Deno.env.get("NINEPAY_SECRET_KEY") || "";
 
-        // Production endpoint — MUST be https://payment.9pay.vn (not paymnet or other typos)
+        // Production endpoint
         let apiEndpoint = Deno.env.get("NINEPAY_API_ENDPOINT") || "https://payment.9pay.vn";
-        // Safety: normalize endpoint (remove trailing slash, fix common typos)
         apiEndpoint = apiEndpoint.replace(/\/+$/, "");
         if (apiEndpoint.includes("paymnet")) {
             console.warn("NINEPAY_API_ENDPOINT has typo 'paymnet', fixing to 'payment'");
@@ -102,7 +94,7 @@ serve(async (req) => {
         }
 
         const body = await req.json();
-        const { userId, planId, months, affiliateCodeId, affiliateId, discountAmount } = body;
+        const { userId, planId, months, affiliateCodeId, affiliateId, discountAmount, clientIp } = body;
 
         console.log("9Pay Request:", { userId, planId, months });
 
@@ -132,84 +124,104 @@ serve(async (req) => {
             amountVND = Math.max(amountVND - discountAmount, 25000);
         }
 
-        const invoiceNo = `EA${Date.now().toString().slice(-8)}${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
+        // Generate invoice number (8 chars alphanumeric, matching 9Pay Postman sample)
+        const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+        let invoiceRandom = '';
+        for (let i = 0; i < 8; i++) {
+            invoiceRandom += chars.charAt(Math.floor(Math.random() * chars.length));
+        }
+        const invoiceNo = `EA${invoiceRandom}`;
         const time = Math.round(Date.now() / 1000);
         const baseUrl = Deno.env.get("NINEPAY_RETURN_URL") || "https://www.englishaidol.com";
         const returnUrl = `${baseUrl}/dashboard?payment=success&provider=9pay&invoice=${invoiceNo}`;
 
         // ============================================================
-        // 9Pay Redirect approach (per official JS sample)
-        // 1. Build params
-        // 2. Sort & URL-encode via URLSearchParams
-        // 3. Sign: POST\n{endpoint}/payments/create\n{time}\n{httpQuery}
-        // 4. Base64-encode params JSON
-        // 5. Return portal URL: {endpoint}/portal?baseEncode=...&signature=...
+        // 9Pay Bank Transfer API (from official Postman collection)
         //
-        // method=COLLECTION forces bank transfer payment flow
+        // Endpoint: POST /api/payments/create-bank-transfer
+        // Auth: Authorization header with HMAC-SHA256 signature
+        // Body: form-data with all parameters
+        //
+        // This is a SERVER-TO-SERVER call (not a portal redirect!)
+        // 9Pay returns bank transfer details (account, QR code, etc.)
         // ============================================================
 
-        // Match EXACTLY the 9Pay Laravel SDK params (no extras like method/currency/lang)
-        // Extra params change the signature and can cause 431 on portal
         const parameters: Record<string, string | number> = {
             merchantKey: merchantKey,
             time: time,
             invoice_no: invoiceNo,
+            lang: "vi",
+            client_ip: clientIp || "127.0.0.1",
             amount: amountVND,
+            currency: "VND",
+            method: "COLLECTION",
             description: `English AIdol ${planKey} ${months}m`,
-            back_url: returnUrl,
             return_url: returnUrl,
+            expires_time: 100, // minutes before transfer expires
         };
 
-        // Build sorted URL-encoded query string
+        // Build sorted URL-encoded query string (matching Postman pre-script)
         const httpQuery = buildHttpQuery(parameters);
 
-        // Build string to sign (per 9Pay official sample)
-        const message = `POST\n${apiEndpoint}/payments/create\n${time}\n${httpQuery}`;
+        // Build string to sign (matching Postman pre-script exactly)
+        // POST\n{endpoint}/api/payments/create-bank-transfer\n{time}\n{httpQuery}
+        const message = `POST\n${apiEndpoint}/api/payments/create-bank-transfer\n${time}\n${httpQuery}`;
         console.log("String to sign:", message);
 
         // Generate HMAC-SHA256 signature
         const signature = await buildSignature(message, merchantSecretKey);
         console.log("Signature:", signature);
 
-        // Base64 encode the params JSON
-        const baseEncode = btoa(JSON.stringify(parameters));
-
-        // Build portal URL
-        const portalParams = buildHttpQuery({
-            baseEncode: baseEncode,
-            signature: signature,
+        // Build form data body (matching Postman body)
+        const formData = new FormData();
+        Object.entries(parameters).forEach(([key, value]) => {
+            formData.append(key, String(value));
         });
-        const paymentUrl = `${apiEndpoint}/portal?${portalParams}`;
 
-        console.log("Payment URL generated:", paymentUrl);
+        // Make server-to-server POST request to 9Pay
+        // Headers match Postman: Authorization + Date
+        const apiUrl = `${apiEndpoint}/api/payments/create-bank-transfer`;
+        console.log("Calling 9Pay API:", apiUrl);
 
-        // Server-side validation: test the portal URL to catch 431 errors before user sees them
+        const ninePayResponse = await fetch(apiUrl, {
+            method: "POST",
+            headers: {
+                "Authorization": `Signature Algorithm=HS256,Credential=${merchantKey},SignedHeaders=,Signature=${signature}`,
+                "Date": String(time),
+            },
+            body: formData,
+        });
+
+        const responseStatus = ninePayResponse.status;
+        const responseText = await ninePayResponse.text();
+        console.log("9Pay API Response - Status:", responseStatus, "Body:", responseText);
+
+        let ninePayData: any;
         try {
-            const testResponse = await fetch(paymentUrl, {
-                method: "GET",
-                redirect: "manual", // Don't follow redirects, just check status
-            });
-            console.log("Portal URL test - Status:", testResponse.status, "Location:", testResponse.headers.get("location"));
+            ninePayData = JSON.parse(responseText);
+        } catch (e) {
+            console.error("Failed to parse 9Pay response:", responseText);
+            return new Response(
+                JSON.stringify({
+                    error: "Invalid response from payment gateway",
+                    details: responseText.substring(0, 500),
+                    httpStatus: responseStatus,
+                }),
+                { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+            );
+        }
 
-            if (testResponse.status === 431) {
-                console.error("9Pay portal returned 431 PERMISSION DENIED - account may not be activated or domain not whitelisted");
-                return new Response(
-                    JSON.stringify({
-                        error: "Payment gateway returned permission denied (431). Please contact support.",
-                        details: "9Pay portal rejected the request. This is usually an account configuration issue on 9Pay's side.",
-                        paymentUrl: paymentUrl, // Still return it for debugging
-                        invoiceNo: invoiceNo,
-                    }),
-                    { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-                );
-            }
-
-            if (testResponse.status !== 302 && testResponse.status !== 200) {
-                console.warn("Portal URL test returned unexpected status:", testResponse.status);
-            }
-        } catch (testError) {
-            console.warn("Portal URL pre-validation failed (non-blocking):", testError);
-            // Non-blocking: still proceed even if test fails (network issues, etc.)
+        // Check for errors from 9Pay
+        if (responseStatus !== 200 || ninePayData.status?.code !== 0) {
+            console.error("9Pay API error:", JSON.stringify(ninePayData));
+            return new Response(
+                JSON.stringify({
+                    error: ninePayData.message || ninePayData.status?.message || "Payment gateway error",
+                    details: ninePayData,
+                    httpStatus: responseStatus,
+                }),
+                { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+            );
         }
 
         // Store pending payment
@@ -226,12 +238,15 @@ serve(async (req) => {
             created_at: new Date().toISOString(),
         });
 
+        // Return bank transfer details to frontend
+        // 9Pay returns: payment_no, bank info, QR code, amount, expiry, etc.
         return new Response(
             JSON.stringify({
                 success: true,
-                paymentUrl: paymentUrl,
                 invoiceNo: invoiceNo,
                 amount: amountVND,
+                bankTransfer: ninePayData.data || ninePayData, // Bank transfer details from 9Pay
+                paymentNo: ninePayData.data?.payment_no || null,
             }),
             { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
